@@ -1,0 +1,10 @@
+[Unit]
+Description=Fans control
+After=xyz.openbmc_project.Hwmon@.service
+
+[Service]
+ExecStart=/usr/bin/fan-control
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
