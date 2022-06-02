@@ -1,10 +1,31 @@
+#include <gpiod.h>
+
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#define NUMBER_OF_FANS 4
+#define NUMBER_OF_CPUS 2
+#define NUMBER_OF_READING_CORES 5
+
+// temperature ranges
+#define LOW_TEMPERATURE 50
+#define BIG_TEMPERATURE 75
+#define VERY_BIG_TEMPERATURE 90
+
+// fan ranges
+#define VERY_LOW_FAN 130
+#define LOW_BIG_FAN 170
+#define BIG_VERY_BIG_FAN 225
+#define CRITICAL_FAN 255
+
+#define GPIO_PS_PWROK_OFFSET 30
 
 namespace fans_control
 {
@@ -12,157 +33,228 @@ namespace fans_control
 boost::asio::io_service io;
 
 // fans groups to write
-static const std::string sysfsFansWritePath =
-    "/sys/devices/platform/ahb/ahb:apb/1e786000.pwm-tacho-controller/hwmon/hwmon0/pwm";
+static std::string sysfsFansWritePath =
+    "/sys/devices/platform/ahb/ahb:apb/1e786000.pwm-tacho-controller/hwmon";
 
-// sensors groups to read
-static const std::string sysfsSensorsReadPath0 =
-    "/xyz/openbmc_project/sensors/temperature/";
-static const std::string sysfsSensorsReadPath1 = "";
+// PECI sensors groups to read (2 sockets)
+static std::string sysfsSensorsReadPath0 =
+    "/sys/devices/platform/ahb/ahb:apb/ahb:apb:bus@1e78b000/1e78b000.peci-bus/peci-0/0-30/peci-cputemp.0/hwmon";
+static const std::string sysfsSensorsReadPath1 =
+    "/sys/devices/platform/ahb/ahb:apb/ahb:apb:bus@1e78b000/1e78b000.peci-bus/peci-0/0-31/peci-cputemp.0/hwmon";
 
-static void sysfsFansWrite(const int& value)
+static bool readyToRead = false;
+
+static std::vector<std::string> idsWithCoreTemps;
+
+typedef struct
 {
-    std::vector<std::ofstream> fans;
-    int numFans;
-    char fanNumber = '1';
+    const char* device = "gpiochip0";
+    unsigned int offset = GPIO_PS_PWROK_OFFSET;
+    bool aclive_low = false;
+    const char* consumer = "fan-control";
+    int flags = 0;
+} gpioPsPowerOkConfig;
+gpioPsPowerOkConfig psPowerOkConfig;
 
-    // open 6 fans files
-    for (numFans = 0; numFans < 6; ++numFans, ++fanNumber)
+static void findIdsWithCoreTemps(std::string& findPath)
+{
+    // start from 6 id
+    int probeId = 6;
+    std::string findStr;
+    while (probeId)
     {
-        fans[numFans].open(sysfsFansWritePath + fanNumber);
-        if (!fanNumber)
+        std::ifstream probeFile(sysfsSensorsReadPath0 + "temp" +
+                                std::to_string(probeId) + "_label");
+        if (probeFile.is_open())
         {
-            std::clog << "Failed to open " << numFans << std::endl;
+            probeFile >> findStr;
+            if (findStr.find("Core") != std::string::npos)
+            {
+                idsWithCoreTemps.push_back(std::to_string(probeId));
+            }
+        }
+        if (idsWithCoreTemps.size() == NUMBER_OF_READING_CORES)
+            return;
+        probeFile.close();
+        ++probeId;
+    }
+}
+
+// through well-known path function get id bad known path
+static void makePathForHwmon(std::string& modifyPath)
+{
+    char id;
+    for (const auto& dir : std::filesystem::directory_iterator(modifyPath))
+        id = *(--dir.path().string().end());
+    modifyPath = modifyPath + "/hwmon" + id + '/';
+}
+
+static void sysfsFansWrite(const int& fanRate, std::string& fansWritePath)
+{
+    std::ofstream fanFile;
+    static int currentFanRate;
+    char chFan = '1';
+
+    if (!(currentFanRate == fanRate))
+    {
+        currentFanRate = fanRate;
+        std::cout << "Write fan rate: " << fanRate << "\n";
+        for (int fan = 0; fan < NUMBER_OF_FANS; ++fan, ++chFan)
+        {
+            fanFile.open(fansWritePath + "pwm" + chFan);
+            if (!fanFile.is_open())
+            {
+                std::cerr << "Failed to open fan file: " << fansWritePath
+                          << "pwm" << chFan << '\n';
+                return;
+            }
+            fanFile << fanRate;
+            fanFile.close();
         }
     }
-
-    /*
-     *   temps(0 - 90) ---> fans(0 - 255)
-     *   [18 - 36]                102
-     *   (36 - 54]                153
-     *   (54 - 72]                204
-     *   (72 - inf                255
-     */
-    if (value >= 18 && value <= 36)
-        for (numFans = 0; numFans < 6; ++numFans)
-            fans[numFans] << 102;
-    else if (value > 36 && value <= 54)
-        for (numFans = 0; numFans < 6; ++numFans)
-            fans[numFans] << 153;
-    else if (value > 54 && value <= 72)
-        for (numFans = 0; numFans < 6; ++numFans)
-            fans[numFans] << 204;
-    else if (value > 72)
-        for (numFans = 0; numFans < 6; ++numFans)
-            fans[numFans] << 255;
-
-    for (numFans = 0; numFans < 6; ++numFans, ++fanNumber)
-    {
-        fans[numFans].close();
-    }
 }
 
-static void processingValues(const std::vector<int>& values1,
-                             const std::vector<int>& values2)
+static void processingValues(const std::vector<int>& tempsValues)
 {
-    int sum1, sum2, res;
-    sum1 = sum2 = 0;
+    int fanRate;
+    int temperature = 0;
 
-    for (const int& value : values1)
+    for (const auto& value : tempsValues)
     {
-        sum1 += value;
+        if (value > temperature)
+            temperature = value;
     }
-    for (const int& value : values2)
+    if (temperature <= LOW_TEMPERATURE)
     {
-        sum1 += value;
+        fanRate = VERY_LOW_FAN;
     }
-
-    // sum / 5 cores and / 2 procs
-    res = (sum1 / 5 + sum2 / 5) / 2;
-    sysfsFansWrite(res);
+    else if (temperature > LOW_TEMPERATURE && temperature <= BIG_TEMPERATURE)
+    {
+        fanRate = LOW_BIG_FAN;
+    }
+    else if (temperature > BIG_TEMPERATURE &&
+             temperature <= VERY_BIG_TEMPERATURE)
+    {
+        fanRate = BIG_VERY_BIG_FAN;
+    }
+    else if (temperature > VERY_BIG_TEMPERATURE)
+    {
+        fanRate = CRITICAL_FAN;
+    }
+    sysfsFansWrite(fanRate, sysfsFansWritePath);
 }
 
-static void readSensorValues()
+static void readSensorValues(std::string& sensorsPath)
 {
-    std::vector<std::ifstream> cpu0;
-    std::vector<std::ifstream> cpu1;
-    std::vector<int> cpuValues0;
-    std::vector<int> cpuValues1;
-    int numOfCores = 5;
-    char chCore = '1';
-    char temperature;
+    std::ifstream sensorFile;
 
-    // cpu0 open
-    for (int core0; core0 < numOfCores; ++core0, ++chCore)
+    // 0...4 - cpu1, 5...9 - cpu2
+    std::vector<int> cpusTemperature(10, 0);
+    std::string temperature;
+    auto idsIter = idsWithCoreTemps.cbegin();
+
+    for (int core = 0; core < NUMBER_OF_READING_CORES * 2; ++core, ++idsIter)
     {
-        cpu0[core0].open(sysfsSensorsReadPath0 + "Core_" + chCore + "_CPU0");
-        cpu0[core0] >> temperature;
-        cpuValues0.push_back(static_cast<int>(temperature) / 1000);
-        cpu0[core0].close();
+        if (core < NUMBER_OF_READING_CORES)
+        {
+            sensorFile.open(sensorsPath + "temp" + *idsIter + "_input");
+            if (!sensorFile.is_open())
+            {
+                std::cerr << "Failed to open sensor file: " << sensorsPath
+                          << "temp" << *idsIter << "_input\n";
+                return;
+            }
+            sensorFile >> temperature;
+            cpusTemperature.push_back(atoi(temperature.c_str()));
+            sensorFile.close();
+        }
+#ifdef CPU2_ENABLE
+        else
+        {
+            if (core == NUMBER_OF_READING_CORES)
+                idsIter = idsWithCoreTemps.cbegin();
+            sensorFile.open(sysfsSensorsReadPath1 + "temp" + *idsIter +
+                            "_input");
+            if (!sensorFile.is_open())
+            {
+                std::cerr << "Failed to open sensor file: " << sensorsPath
+                          << "temp" << *idsIter << "_input\n";
+                return;
+            }
+            sensorFile >> temperature;
+            cpusTemperature.push_back(atoi(temperature.c_str()));
+            sensorFile.close();
+        }
+#endif
     }
-    // cpu1 open
-    for (int core1; core1 < numOfCores; ++core1, ++chCore)
+    // make degrees celsius
+    for (auto& value : cpusTemperature)
     {
-        cpu1[core1].open(sysfsSensorsReadPath1 + "Core_" + chCore + "_CPU1");
-        cpu1[core1] >> temperature;
-        cpuValues1.push_back(static_cast<int>(temperature) / 1000);
-        cpu1[core1].close();
+        value /= 1000;
     }
+
+    processingValues(cpusTemperature);
 }
 
 static void waitSysfsSensors(const boost::system::error_code&,
-                             boost::asio::steady_timer* timer)
+                             boost::asio::deadline_timer* timer)
 {
-    readSensorValues();
-    timer->expires_at(timer->expiry() + boost::asio::chrono::seconds(1));
+    if (readyToRead)
+    {
+        std::cout << "Start reading...\n";
+        readSensorValues(sysfsSensorsReadPath0);
+    }
+    timer->expires_at(timer->expires_at() + boost::posix_time::seconds(1));
     timer->async_wait(
         boost::bind(waitSysfsSensors, boost::asio::placeholders::error, timer));
 }
 
-static void prepareWaitSysfs()
-{
-    boost::asio::steady_timer timer(io, boost::asio::chrono::seconds(1));
-    timer.async_wait(boost::bind(waitSysfsSensors,
-                                 boost::asio::placeholders::error, &timer));
-}
-
-static void run()
-{
-    prepareWaitSysfs();
-}
-
+/*  In result, PECI bus need some seconds to initialize and show temperature
+ *  values in sysfs.
+ */
 static void waitPECIBus(const boost::system::error_code&,
-                        boost::asio::steady_timer* timer,
-                        std::ifstream* checkFile, int* value)
+                        boost::asio::deadline_timer* timer,
+                        std::string* tempValue, int* boardState)
 {
-    *checkFile >> *value;
-    if (value > 0)
+    std::ifstream peciTemp(sysfsSensorsReadPath0 + "temp" +
+                           *idsWithCoreTemps.cbegin() + "_input");
+
+    // get server state
+    *boardState = gpiod_ctxless_get_value_ext(
+        psPowerOkConfig.device, psPowerOkConfig.offset,
+        psPowerOkConfig.aclive_low, psPowerOkConfig.consumer,
+        psPowerOkConfig.flags);
+
+    if (*boardState)
     {
-        return;
+        if (!peciTemp)
+        {
+            std::cerr
+                << "check PECI temp: Failed to read peci temp file. Check PECI configuration...\n";
+        }
+        peciTemp >> *tempValue;
+        std::cout << "tempValue: " << *tempValue << '\n';
+        if (!tempValue->empty())
+        {
+            std::cout << "check PECI temp: PECI ready to read\n";
+            readyToRead = true;
+        }
+        else if (tempValue->empty())
+        {
+            std::cout << "check PECI temp: wait PECI...\n";
+        }
     }
-    timer->expires_at(timer->expiry() + boost::asio::chrono::seconds(2));
+    else
+    {
+        std::cout << "skip: power off\n";
+        *tempValue = "";
+        if (readyToRead)
+            readyToRead = false;
+    }
+
+    timer->expires_at(timer->expires_at() + boost::posix_time::seconds(1));
     timer->async_wait(boost::bind(waitPECIBus, boost::asio::placeholders::error,
-                                  timer, checkFile, value));
-}
-
-// in short, getting value by sysfs takes more time and this functions check it
-static bool checkPeciBus(const std::string pathCheck)
-{
-    boost::asio::steady_timer timer(io, boost::asio::chrono::seconds(2));
-    int value = 0;
-
-    std::ifstream coreTempFile(pathCheck);
-    if (!coreTempFile)
-    {
-        std::cerr << "Failed to open file. Configure PECI bus\n";
-        return -1;
-    }
-
-    timer.async_wait(boost::bind(waitPECIBus, boost::asio::placeholders::error,
-                                 &timer, &coreTempFile, &value));
-
-    if (value > 0)
-        return true;
+                                  timer, tempValue, boardState));
 }
 
 }; // namespace fans_control
@@ -171,11 +263,24 @@ int main()
 {
     using namespace fans_control;
 
-    if (checkPeciBus(sysfsSensorsReadPath0 + "Core_5_CPU0"))
-        std::cout << "Start fans control...\n";
+    makePathForHwmon(sysfsFansWritePath);
+    makePathForHwmon(sysfsSensorsReadPath0);
 
-    run();
+    findIdsWithCoreTemps(sysfsSensorsReadPath0);
 
+    boost::asio::deadline_timer waitPECITimer(io,
+                                              boost::posix_time::seconds(1));
+    std::string tempValue = "";
+    int boardState;
+    waitPECITimer.async_wait(
+        boost::bind(waitPECIBus, boost::asio::placeholders::error,
+                    &waitPECITimer, &tempValue, &boardState));
+
+    boost::asio::deadline_timer fansControllerTimer(
+        io, boost::posix_time::seconds(1));
+    fansControllerTimer.async_wait(boost::bind(waitSysfsSensors,
+                                               boost::asio::placeholders::error,
+                                               &fansControllerTimer));
     io.run();
     return 0;
 }

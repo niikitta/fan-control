@@ -13,6 +13,7 @@ add_definitions(-DBOOST_ASIO_DISABLE_THREADS)
 set(SRC_FILES fan-control.cpp)
 
 add_executable(${PROJECT_NAME} ${SRC_FILES})
+target_link_libraries(${PROJECT_NAME} gpiod)
 
 install(TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES fan-control.service DESTINATION /lib/systemd/system)
