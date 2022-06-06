@@ -81,12 +81,21 @@ static void findIdsWithCoreTemps(std::string& findPath)
 }
 
 // through well-known path function get id bad known path
-static void makePathForHwmon(std::string& modifyPath)
+static bool makePathForHwmon(std::string& modifyPath)
 {
     char id;
-    for (const auto& dir : std::filesystem::directory_iterator(modifyPath))
-        id = *(--dir.path().string().end());
-    modifyPath = modifyPath + "/hwmon" + id + '/';
+    try
+    {
+        for (const auto& dir : std::filesystem::directory_iterator(modifyPath))
+            id = *(--dir.path().string().end());
+        modifyPath = modifyPath + "/hwmon" + id + '/';
+    }
+    catch (const std::filesystem::filesystem_error& ec)
+    {
+        std::cout << "Pls, check PECI configuration.\n" << ec.what() << '\n';
+        return false;
+    }
+    return true;
 }
 
 static void sysfsFansWrite(const int& fanRate, std::string& fansWritePath)
@@ -98,7 +107,7 @@ static void sysfsFansWrite(const int& fanRate, std::string& fansWritePath)
     if (!(currentFanRate == fanRate))
     {
         currentFanRate = fanRate;
-        std::cout << "Write fan rate: " << fanRate << "\n";
+        std::cout << "Write fans rate: " << fanRate << "/255\n";
         for (int fan = 0; fan < NUMBER_OF_FANS; ++fan, ++chFan)
         {
             fanFile.open(fansWritePath + "pwm" + chFan);
@@ -201,7 +210,6 @@ static void waitSysfsSensors(const boost::system::error_code&,
 {
     if (readyToRead)
     {
-        std::cout << "Start reading...\n";
         readSensorValues(sysfsSensorsReadPath0);
     }
     timer->expires_at(timer->expires_at() + boost::posix_time::seconds(1));
@@ -233,20 +241,14 @@ static void waitPECIBus(const boost::system::error_code&,
                 << "check PECI temp: Failed to read peci temp file. Check PECI configuration...\n";
         }
         peciTemp >> *tempValue;
-        std::cout << "tempValue: " << *tempValue << '\n';
         if (!tempValue->empty())
         {
-            std::cout << "check PECI temp: PECI ready to read\n";
             readyToRead = true;
         }
-        else if (tempValue->empty())
-        {
-            std::cout << "check PECI temp: wait PECI...\n";
-        }
+        peciTemp.close();
     }
     else
     {
-        std::cout << "skip: power off\n";
         *tempValue = "";
         if (readyToRead)
             readyToRead = false;
@@ -263,8 +265,10 @@ int main()
 {
     using namespace fans_control;
 
-    makePathForHwmon(sysfsFansWritePath);
-    makePathForHwmon(sysfsSensorsReadPath0);
+    if (!makePathForHwmon(sysfsFansWritePath))
+        return -1;
+    if (!makePathForHwmon(sysfsSensorsReadPath0))
+        return -1;
 
     findIdsWithCoreTemps(sysfsSensorsReadPath0);
 
